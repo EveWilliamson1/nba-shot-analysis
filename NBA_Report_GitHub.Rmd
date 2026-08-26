@@ -1,0 +1,1220 @@
+---
+title: "Exploring NBA Shot Data: Insights from the 2014-2015 Season"
+author: 
+- "Megan Sanderson, Clara Thompson,"
+- "Eve Williamson and Sam James"
+
+fontsize: 10pt
+fontfamily: times
+geometry: margin=0.8in
+
+header-includes:
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+  - \usepackage{placeins}
+  - \usepackage{etoolbox}
+  - \AtBeginEnvironment{Shaded}{\small}
+  - \usepackage{enumitem}
+  - \setlist{topsep=0pt, partopsep=0pt, parsep=0pt, itemsep=0pt, left=1.5em}
+
+output:
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: true 
+    citation_package: natbib
+    fig_caption: true
+    highlight: haddock 
+    df_print: kable
+    extra_dependencies:
+      caption: ["labelfont={bf}"]
+      float: null
+bibliography: [refs.bib] 
+biblio-style: apalike
+link-citations: yes
+
+abstract: "We present a comprehensive analysis of the `NBA_SHOTS_CLEAN` dataset from the 2014-2015 season to identify key performance factors and financial implications in basketball shooting. Our findings reveal significant variations in shooting efficiency across experience levels and positions, with veterans outperforming rookies and centers achieving higher field goal percentages than guards. Contextual factors such as home court advantage, clutch situations, and defender distance substantially impact shooting success. Our financial analysis identifies correlations between player experience and salary, evaluates performance-based compensation efficiency, and assesses team salary cap allocation strategies. These insights provide evidence-based guidance for player development, tactical decision-making, and financial management in professional basketball."
+---
+
+<!-- set knitr options here -->
+
+```{r setup, include=FALSE}
+library(knitr)
+#library(tidyverse)
+library(kableExtra)
+## Do not include warning messages in the report 
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.pos = "H")
+```
+
+<!-- the report starts here -->
+
+```{r, include=FALSE}
+## Packages
+library(Hmisc)
+library(pROC)
+library(corrplot)
+library(stringi)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(tidyr)
+library(gridExtra)
+library(broom)
+library(caret)
+library(reshape2)
+
+## Data used later in the report
+## The main combined dataset is constructed from the three source files below
+## in the `complete-dataset-formation` chunk rather than read from a pre-built file.
+Team_cap_info <- read.csv("NBA_Team_Salary_Cap_Tracker.csv")
+```
+
+# Introduction and Data Preparation {#sec:Intro}
+
+The National Basketball Association (NBA) is the North America's premier professional basketball league, with player performance evaluated through numerous advanced metrics.
+
+```{r complete-dataset-formation, results='hide', echo=FALSE}
+# Load the datasets
+shots_clean <- read.csv("NBA_Shots_Clean.csv")
+player_info <- read.csv("Player_Info.csv")
+player_salary <- read.csv("Player_Salary.csv")
+
+# Create a full name column in player_info by combining first and last names
+player_info <- player_info %>%
+  mutate(PLAYER_NAME = paste(First_Name, Surname))  
+
+# For player_salary, ensure the NAME column matches the format in shots_clean
+# If needed, rename the column to match
+player_salary <- player_salary %>%
+  rename(PLAYER_NAME = Name)  
+
+# Merge based on player names
+merged_data <- shots_clean %>%
+  left_join(player_info, by = "PLAYER_NAME")
+
+# Then merge with salary data
+complete_data <- merged_data %>%
+  left_join(player_salary, by = "PLAYER_NAME")
+
+# Create experience groups
+complete_data <- complete_data %>%
+  mutate(experience_group = case_when(
+    is.na(Experience) ~ NA_character_,  # Handle NA values
+    Experience == "R" ~ "Rookie",  # Handle "R" which likely means rookie
+    as.numeric(Experience) >= 0 & as.numeric(Experience) <= 1 ~ "Rookie",
+    as.numeric(Experience) > 1 & as.numeric(Experience) <= 5 ~ "Early Career",
+    as.numeric(Experience) > 5 & as.numeric(Experience) <= 10 ~ "Mid Career",
+    as.numeric(Experience) > 10 ~ "Veteran",
+    TRUE ~ NA_character_  # Catch any other unexpected values
+  ))
+
+# Verify the grouping
+table(complete_data$Experience, complete_data$experience_group, useNA = "ifany")
+
+# Convert to ordered factor
+complete_data$experience_group <- factor(complete_data$experience_group, 
+                                        levels = c("Rookie", "Early Career", "Mid Career", "Veteran"),
+                                        ordered = TRUE)
+
+complete_data <- complete_data %>%
+  dplyr::rename(SHOT_DISTANCE = SHOT_DIST) %>%   
+  dplyr::select(-X, -First_Name, -Surname)       # Remove unwanted columns
+
+# Use the constructed dataset throughout the rest of the report
+shots_with_all <- complete_data
+
+# Optional: save the constructed dataset locally. It is not required as an input file.
+# write.csv(complete_data, "NBA_Complete_Dataset.csv", row.names = FALSE)
+```
+
+```{r data_summary, results='hold', echo=FALSE}
+# Simple overview of the combined dataset
+n_players <- length(unique(complete_data$PLAYER_NAME))
+n_teams <- length(unique(complete_data$Team))
+n_games <- length(unique(paste(complete_data$GAME_ID, complete_data$DATE)))
+n_shots <- nrow(complete_data)
+
+# Overall shooting percentages
+overall_fg <- mean(complete_data$SUCCESS, na.rm = TRUE) * 100
+two_pt_fg <- mean(complete_data$SUCCESS[complete_data$PTS_TYPE == 2], na.rm = TRUE) * 100
+three_pt_fg <- mean(complete_data$SUCCESS[complete_data$PTS_TYPE == 3], na.rm = TRUE) * 100
+```
+
+This study utilises a comprehensive dataset combining player shot data, biographical information, and salary details from the 2014-2015 NBA season. Originally sourced from three separate files (`NBA_Shots_Clean.csv`, `Player_Info.csv`, and `Player_Salary.csv`), our integrated dataset comprises `r format(n_shots, big.mark=",")` shots taken by `r n_players` players across `r n_teams` teams. Overall shooting efficiency across the league was `r round(overall_fg, 1)`%, with 2-point field goal percentage at `r round(two_pt_fg, 1)`% and 3-point field goal percentage at `r round(three_pt_fg, 1)`%.
+
+Our investigation addresses several key research questions:
+
+1. How does player experience influence shot selection and efficiency across different court locations?
+2. What are the relationships between physical attributes (height, weight) and shooting performance?
+3. How do positional roles impact shooting patterns and efficiency?
+4. What contextual factors (home court, defensive pressure, clutch situations) affect shooting outcomes?
+5. To what extent do shooting performance metrics correlate with player salaries?
+
+We employed several preprocessing steps, including handling missing values, categorising players into experience groups (Rookies: 0-1 years, Early Career: 2-5 years, Mid Career: 6-9 years, Veterans: 10+ years), classifying shots into court zones based on distance, and grouping players into height quartiles for comparative analysis.
+
+# Experience-based shot selection and performance {#sec:experience-based-shot}
+
+Having established our research questions and data preparation approach, we now examine how player experience influences shooting patterns and efficiency. Early Career players account for the highest proportion of shot attempts (37.1%), followed by Mid Career players (23.3%). This distribution contextualises the analysis that follows, highlighting how shot volume varies over the course of an NBA player's development. A full breakdown of shot distributions by experience group is provided in Table \@ref(tab:experience-summary) in the Appendix.
+
+## Shooting efficieny evolution across career stages {#sec:shooting-career}
+
+To assess the relationship between player experience and shooting efficiency, we conduct a one-way ANOVA. 
+
+```{r efficiency_summary, echo=FALSE}
+# Calculate shooting efficiency by experience group with confidence intervals
+efficiency_by_exp <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  group_by(experience_group) %>%
+  summarise(
+    FG_PCT = mean(SUCCESS, na.rm = TRUE),
+    Total_Shots = sum(!is.na(SUCCESS)),
+    SE = sqrt((FG_PCT * (1-FG_PCT))/Total_Shots),
+    CI_Lower = FG_PCT - 1.96 * SE,
+    CI_Upper = FG_PCT + 1.96 * SE,
+    eFG_PCT = sum(ifelse(PTS_TYPE == 3, SUCCESS * 1.5, SUCCESS), na.rm = TRUE) / 
+              sum(!is.na(SUCCESS)),
+    Points_Per_Shot = mean(ifelse(SUCCESS == 1, PTS_TYPE, 0), na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(match(experience_group, c("Rookie", "Early Career", "Mid Career", "Veteran")))
+
+```
+
+```{r, echo=FALSE}
+options(show.signif.stars = FALSE)
+# One-way ANOVA to test the effect of experience on field goal percentage
+shot_success_model <- aov(SUCCESS ~ experience_group, data = filter(shots_with_all, 
+  !is.na(experience_group)))
+summary(shot_success_model)
+```
+
+```{r, echo=FALSE}
+
+anova_results <- summary(shot_success_model)
+# Extract values for caption
+df1 <- anova_results[[1]][['Df']][1]
+df2 <- anova_results[[1]][['Df']][2]
+f_value <- round(anova_results[[1]][['F value']][1], 2)
+```
+
+The analysis reveals a statistically significant effect of player experience on shooting efficiency (ANOVA: F(`r anova_results[[1]][['Df']][1]`,`r anova_results[[1]][['Df']][2]`) = `r round(anova_results[[1]][['F value']][1], 2)`, p < 0.001). The p-value of less than 0.001 indicates that the observed differences in shooting efficiency across career stages are highly unlikely to occur by chance. Figure \@ref(fig:efficiency-barplot) illustrates this progression: 
+
+```{r efficiency-barplot, fig.width=5, fig.height=2, fig.cap=paste0("Field goal percentage by experience level with 95% confidence intervals."), echo=FALSE}
+
+# Create plot with confidence intervals
+ggplot(efficiency_by_exp, aes(
+    x = factor(experience_group, levels = c("Rookie", "Early Career", "Mid Career", "Veteran")),
+    y = FG_PCT,
+    fill = experience_group  # Map fill to group for color
+)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2) +
+  geom_text(aes(label = sprintf("%.1f%%", FG_PCT*100)),
+            vjust = -0.5, size = 3) +
+  labs(
+    title = "Shooting Efficiency Progression Across Career Stages",
+    subtitle = "Field goal percentage increases significantly with experience",
+    x = "Experience Level",
+    y = "Field Goal Percentage"
+  ) +
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 10, face = "bold"),
+    plot.subtitle = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.title = element_text(size = 9)
+  ) +
+  scale_y_continuous(         
+    limits = c(0, max(efficiency_by_exp$CI_Upper) * 1.1),
+    labels = percent_format(accuracy = 1)
+  ) +
+  scale_fill_brewer(palette = "Set2", name = "Experience Group")
+```
+
+Rookies convert 43.2% of field goal attempts, while Early Career players demonstrate substantial improvement at 45.8%. This 2.6 percentage point increase represents the largest efficiency jump in a player's development cycle, suggesting that the most significant improvement in fundamental shooting ability occurs during this early transition. The efficiency progression stabilizes in later career stages, with Mid Career (45.4%) and Veteran (45.7%) players maintaining similar shooting percentages. 
+
+Zone-specific analysis reveals distinctive efficiency patterns based on court location (Figure \@ref(fig:heat-map-zone)). We conducted a two-way ANOVA to examine the combined effects of experience level and court zone on shooting efficiency:
+
+```{r zone_efficiency, echo=FALSE}
+# Define court zones once
+shots_with_zones <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  mutate(court_zone = case_when(
+    SHOT_DISTANCE < 4 ~ "Restricted Area",
+    SHOT_DISTANCE < 8 ~ "Paint",
+    SHOT_DISTANCE < 16 ~ "Mid-range",
+    SHOT_DISTANCE < 23.75 ~ "Long 2",
+    TRUE ~ "3-point"
+  ))
+
+# Calculate efficiency by zone and experience
+zone_efficiency <- shots_with_zones %>%
+  group_by(experience_group, court_zone) %>%
+  summarise(
+    FG_PCT = mean(SUCCESS, na.rm = TRUE),
+    attempts = n(),
+    .groups = 'drop'
+  )
+```
+
+```{r}
+options(show.signif.stars = FALSE)
+# Two-way ANOVA for zone and experience
+zone_exp_model <- aov(SUCCESS ~ experience_group * court_zone, data = shots_with_zones)
+zone_exp_results <- summary(zone_exp_model)
+summary(zone_exp_model)
+```
+
+This confirms significant main effects for both experience group (F(`r zone_exp_results[[1]][['Df']][1]`,`r zone_exp_results[[1]][['Df']][3]`) = `r round(zone_exp_results[[1]][['F value']][1], 2)`, p < 0.001) and court zone (F(`r zone_exp_results[[1]][['Df']][2]`,`r zone_exp_results[[1]][['Df']][3]`) = `r round(zone_exp_results[[1]][['F value']][2], 2)`, p < 0.001), as well as a significant interaction effect (F(`r zone_exp_results[[1]][['Df']][3]`,`r zone_exp_results[[1]][['Df']][3]`) = `r round(zone_exp_results[[1]][['F value']][3], 2)`, p < 0.01).
+
+```{r heat-map-zone, fig.width=4.5, fig.height=2.3, fig.cap="Shooting efficiency by court zone and experience level. Two-way ANOVA shows significant main effects for both experience (p < 0.001) and court zone (p < 0.001), with a significant interaction (p < 0.01).", echo=FALSE}
+ggplot(zone_efficiency, 
+       aes(x = factor(court_zone, 
+                     levels = c("Restricted Area", "Paint", "Mid-range", "Long 2", "3-point")),
+           y = factor(experience_group, 
+                     levels = c("Veteran", "Mid Career", "Early Career", "Rookie")),
+           fill = FG_PCT)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.1f%%", FG_PCT*100)), 
+            color = "black", size = 2.5, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#4575b4", mid = "#ffffbf", high = "#d73027", 
+    midpoint = 0.5, limits = c(0.25, 0.75),
+    labels = percent_format(accuracy = 1),
+    name = "FG%"
+  ) +
+  labs(
+    title = "Shot Efficiency Heatmap by Court Zone and Experience",
+    subtitle = "Rookies underperform in all zones; largest gaps in mid-range and long 2s",
+    x = "Court Zone", 
+    y = "Experience Level"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7),
+    plot.title = element_text(size = 9, face = "bold"),
+    plot.subtitle = element_text(size = 7),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.size = unit(0.8, "lines"),
+    panel.grid = element_blank(),
+    plot.margin = margin(3, 3, 3, 3)
+  )
+```
+
+Key findings include:
+
+1. **Zone-specific experience gaps**: Rookies underperform in all court zones, with the gap most pronounced in mid-range shots (8.3 percentage points below Veterans) and smallest in the restricted area (3.2 percentage points), suggesting that close-range finishing ability develops earlier than perimeter shooting.
+2. **Learning curve variation**: The restricted area shows the smallest experience gap (3.2 percentage points), suggesting close-range finishing transfers more readily from pre-NBA play.
+3. **Three-point development**: While 3-point shooting shows substantial improvement with experience (3.2 percentage points), this gap is smaller than the mid-range gap, potentially indicating that players who reach the NBA already possess relatively developed 3-point shooting skills.
+
+Analysis of shot type distribution reveals an inverse relationship between experience and 3-point attempt frequency. We confirmed this with a chi-square test:
+
+```{r shot_type_analysis, echo=FALSE}
+# Shot type selection by experience level
+shot_type_dist <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  group_by(experience_group, PTS_TYPE) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(experience_group) %>%
+  mutate(percentage = count / sum(count) * 100) %>%
+  pivot_wider(names_from = PTS_TYPE, values_from = percentage)
+
+# Create chi-square test
+shot_type_table <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  xtabs(~ experience_group + PTS_TYPE, data = .)
+shot_type_test <- chisq.test(shot_type_table)
+
+# Extract chi-square test statistics for caption
+chi_df <- shot_type_test$parameter
+chi_stat <- round(shot_type_test$statistic, 2)
+
+# Distance metrics by experience group
+distance_metrics <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  group_by(experience_group) %>%
+  summarise(
+    Mean_Distance = mean(SHOT_DISTANCE, na.rm = TRUE),
+    Median_Distance = median(SHOT_DISTANCE, na.rm = TRUE),
+    SD_Distance = sd(SHOT_DISTANCE, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(match(experience_group, c("Rookie", "Early Career", "Mid Career", "Veteran")))
+```
+
+```{r shot_type_simple_test, echo=FALSE}
+# Chi-square test for shot type distribution across experience levels
+shot_type_test <- chisq.test(table(shots_with_all$experience_group, 
+  shots_with_all$PTS_TYPE))
+shot_type_test
+```
+
+The test results (`r paste0("\\(\\chi^2\\)(", chi_df, ") = ", chi_stat, ", p < 0.001")`) confirm significant differences in shot type distribution across experience levels, with Rookies attempting the highest proportion of 3-pointers (29.5%) and Veterans taking significantly fewer (23.5%).
+
+```{r, fig.height=2.2, fig.width=3.8, fig.cap=paste0("Distribution of 2-point vs. 3-point attempts by experience level. Chi-square test: $\\chi^2$(", chi_df, ") = ", chi_stat, ", p < 0.001."), echo=FALSE, fig.pos="H"}
+# Create shot type distribution plot
+shot_type_data <- shots_with_all %>%
+  filter(!is.na(experience_group)) %>%
+  group_by(experience_group, PTS_TYPE) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(experience_group) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+ggplot(shot_type_data, 
+       aes(x = factor(experience_group, 
+                     levels = c("Rookie", "Early Career", "Mid Career", "Veteran")),
+           y = percentage, 
+           fill = factor(PTS_TYPE))) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = sprintf("%.1f%%", percentage)),
+            position = position_stack(vjust = 0.5), 
+            color = "white", size = 2.5) +
+  labs(title = "Shot Type Distribution Across Experience Levels",
+       subtitle = "3-point attempt frequency decreases with experience",
+       x = "Experience Level", 
+       y = "Percentage of Shots", 
+       fill = "Shot Type") +
+  scale_fill_manual(values = c("2" = "darkblue", "3" = "darkred"),
+                    labels = c("2" = "2-Point", "3" = "3-Point")) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6),
+    legend.key.size = unit(0.8, "lines"),
+    plot.title = element_text(size = 8, face = "bold"),
+    plot.subtitle = element_text(size = 6),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 6),
+    plot.margin = margin(2, 2, 2, 2)
+  )
+```
+
+## Interaction between physical attributes and experience {#sec:attributes-experience}
+
+Height interacts meaningfully with experience to influence shooting efficiency, as confirmed by a two-way ANOVA (significant main effects for both experience and height groups, p < 0.001; significant interaction effect, p < 0.001).
+
+```{r height_experience_interaction, echo=FALSE}
+# Create height groups
+shots_with_all$height_group <- cut(shots_with_all$Height, 
+                                breaks = quantile(shots_with_all$Height, 
+                                                 probs = seq(0, 1, 0.25), 
+                                                 na.rm = TRUE),
+                                labels = c("Short", "Medium", "Tall", "Very Tall"),
+                                include.lowest = TRUE)
+
+# Two-way ANOVA model
+shots_with_all$experience_group <- factor(shots_with_all$experience_group, 
+                                         levels = c("Rookie", "Early Career", "Mid Career", "Veteran"),
+                                         ordered = TRUE)
+interaction_model <- aov(SUCCESS ~ experience_group * height_group, 
+                        data = filter(shots_with_all, 
+                                     !is.na(experience_group) & !is.na(height_group)))
+interaction_results <- summary(interaction_model)
+
+# Calculate group means for interaction plot
+interaction_means <- shots_with_all %>%
+  filter(!is.na(experience_group) & !is.na(height_group)) %>%
+  group_by(experience_group, height_group) %>%
+  summarise(
+    FG_PCT = mean(SUCCESS, na.rm = TRUE),
+    n = n(),
+    .groups = 'drop'
+  )
+```
+
+```{r interaction-plot, fig.width=4, fig.height=2.8, fig.cap="Interactive effect of height and experience on shooting efficiency. Two-way ANOVA shows significant main effects for both variables and their interaction (all p < 0.001).", echo=FALSE, fig.pos="H"}
+# Create interaction plot
+ggplot(interaction_means, 
+       aes(x = experience_group, y = FG_PCT, 
+           color = height_group, group = height_group)) +
+  geom_point(aes(size = n), alpha = 0.7) +
+  geom_line(size = 0.8) +
+  labs(title = "Effect of Height & Experience on Shooting Efficiency",
+       subtitle = "Distinct development trajectories for different height groups",
+       x = "Experience Level", 
+       y = "Field Goal Percentage", 
+       color = "Height Group",
+       size = "Shot Count") +
+  scale_y_continuous(limits = c(0.38, 0.58), labels = percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(size = 9, face = "bold"),
+        plot.subtitle = element_text(size = 7),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7),
+        legend.key.size = unit(0.8, "lines"))
+
+```
+
+Height categories exhibit distinct developmental trajectories across career stages (Figure \@ref(fig:interaction-plot)). Very tall players (top quartile) show exceptional early-career efficiency (52.4%) followed by mid-career decline and veteran recovery, suggesting initial reliance on height advantage before developing compensatory skills. Conversely, shorter players (bottom quartile) demonstrate consistent linear improvement with experience (40.2% as rookies to 45.5% as veterans). Medium-height players maintain the most stable performance trajectory across career stages.
+
+These patterns suggest specialized developmental paths: taller players leverage physical attributes early but must adapt their approach as they age, while shorter players show continuous technical improvement throughout their careers, potentially reflecting greater reliance on skill development rather than physical advantages.
+
+# Positon based analysis {#sec:position-analysis}
+
+Building upon our examination of experience-based shooting patterns, we now investigate how player position influences shooting efficiency, physical attributes, and shot selection in the NBA. 
+
+## Shooting efficiency by position {#sec:shooting-position}
+
+Analysis of field goal percentage by position reveals significant differences across the five traditional NBA positions (ANOVA: p < 0.001). As shown in Figure \@ref(fig:shooting-efficiency-position), Centers achieved the highest efficiency (51.3%), followed by Power Forwards (47.7%), with guards displaying the lowest percentages (42.9-43.4%).
+
+```{r shooting-efficiency-position, echo=FALSE, fig.width=4.5, fig.height=2.3, fig.cap="Field goal percentage by position with 95\\% confidence intervals. ANOVA shows significant differences between positions (p < 0.001)."}
+# Read the data
+nba_data <- complete_data
+
+# Convert SUCCESS to numeric
+nba_data$SUCCESS <- as.numeric(as.character(nba_data$SUCCESS))
+
+# Get unique positions
+positions <- unique(nba_data$Pos)
+positions <- positions[!is.na(positions)]
+
+# Create data frame for results
+shooting_stats <- data.frame(Pos = character(), 
+                            FG_PCT = numeric(), 
+                            Shot_Attempts = numeric(), 
+                            stringsAsFactors = FALSE)
+
+# Calculate stats for each position
+for (pos in positions) {
+  pos_data <- nba_data[nba_data$Pos == pos, ]
+  total_shots <- nrow(pos_data)
+  
+  if(total_shots > 0 && sum(!is.na(pos_data$SUCCESS)) > 0) {
+    fg_pct <- mean(pos_data$SUCCESS, na.rm = TRUE) * 100
+    shooting_stats <- rbind(shooting_stats, 
+                           data.frame(Pos = pos,  # Changed from Position to Pos
+                                     FG_PCT = fg_pct, 
+                                     Shot_Attempts = total_shots))
+  }
+}
+
+# Filter out invalid data
+shooting_stats <- shooting_stats[is.finite(shooting_stats$FG_PCT), ]
+
+# Calculate confidence intervals
+position_efficiency <- shooting_stats %>%
+  mutate(
+    FG_PCT = FG_PCT/100,  # Convert to proportion
+    SE = sqrt((FG_PCT * (1-FG_PCT))/Shot_Attempts),
+    CI_Lower = FG_PCT - 1.96 * SE,
+    CI_Upper = FG_PCT + 1.96 * SE
+  )
+
+# Create position efficiency plot
+ggplot(position_efficiency, aes(x = reorder(Pos, -FG_PCT), y = FG_PCT)) +
+  geom_bar(stat = "identity", fill = "darkorange", alpha = 0.8, width = 0.6) +  
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.15) +  
+  geom_text(aes(label = sprintf("%.1f%%", FG_PCT*100)),
+            vjust = -0.3, size = 2.5) + 
+  labs(title = "Shooting Efficiency by Position",
+       subtitle = "Centers show highest efficiency; guards lowest",
+       x = "Position", 
+       y = "Field Goal Percentage") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 9, face = "bold"),  
+        plot.subtitle = element_text(size = 8), 
+        axis.title = element_text(size = 8),  
+        axis.text = element_text(size = 7),  
+        plot.margin = margin(5, 5, 5, 5)) +  
+  scale_y_continuous(limits = c(0, max(position_efficiency$CI_Upper) * 1.05),  
+                    labels = percent_format(accuracy = 1))
+```
+  
+```{r, echo=FALSE}
+pop_mean <- mean(nba_data$SUCCESS, na.rm = TRUE)
+pop_sd <- sd(nba_data$SUCCESS, na.rm = TRUE)
+
+if (is.na(pop_sd) || pop_sd == 0) {
+  stop("Population standard deviation is zero or NA; cannot compute Z-scores.")
+}
+
+z_scores <- data.frame(Position = character(), FG_Z = numeric(), stringsAsFactors = FALSE)
+
+for (pos in positions) {
+  pos_data <- nba_data[nba_data$Pos == pos, ]  # Use correct column name
+  fg_pct <- mean(pos_data$SUCCESS, na.rm = TRUE)
+  z <- (fg_pct - pop_mean) / pop_sd
+  z_scores <- rbind(z_scores, data.frame(Position = pos, FG_Z = z))
+}
+
+# Filter out NA/Inf values
+z_scores <- z_scores[is.finite(z_scores$FG_Z), ]
+```
+
+The z-scores highlight the relative shooting efficiency of players by position compared to the league average. Centers showed a slightly above-average efficiency (Z = 0.12), indicating a modest positive deviation from the league average, while Power Forwards also demonstrated slightly above-average efficiency (Z = 0.05), though their performance was closer to average compared to Centers. Small Forwards exhibited near-average performance (Z = -0.04), with shooting efficiency that is very close to the league mean. Shooting Guards and Point Guards displayed below-average efficiency (Z = -0.04 and Z = -0.05, respectively), suggesting that backcourt players generally have a lower shooting percentage compared to the league average. These z-scores indicate that frontcourt players (Centers and Power Forwards) have a slight advantage in shooting efficiency compared to backcourt players (Shooting Guards and Point Guards), who tend to shoot below the league average.
+
+## Physical attributes and shot characteristics by position {#sec:attributes-position}
+
+The physical differences between positions create fundamental distinctions in playing style and shooting approach. Our analysis revealed clear positional differentiation in height, weight, and BMI:
+
+```{r reset-table-counter, echo=FALSE, results='asis'}
+cat("\\setcounter{table}{1}")
+```
+
+```{r, echo=FALSE, fig.pos="H"}
+physical_stats <- data.frame(Position = character(), Avg_Height = numeric(), Avg_Weight = numeric(), Avg_BMI = numeric(), stringsAsFactors = FALSE)
+
+for (pos in positions) {
+  # Subset for the current position
+  pos_data <- nba_data[nba_data$Pos == pos, ]  
+  
+  # Filter out rows with NA in any of the relevant columns
+  pos_data_clean <- pos_data[!is.na(pos_data$Height) & !is.na(pos_data$Weight) & !is.na(pos_data$BMI), ]
+  
+  physical_stats <- rbind(physical_stats, data.frame(
+    Position = pos,
+    Avg_Height = mean(pos_data_clean$Height),
+    Avg_Weight = mean(pos_data_clean$Weight),
+    Avg_BMI = mean(pos_data_clean$BMI)
+  ))
+}
+```
+
+```{r, results='asis', echo=FALSE}
+cat("\\begin{center}\n")
+cat("\\begin{tabular}{lccc}\n")
+cat("\\textbf{Position} & \\textbf{Average Height (in)} & \\textbf{Average Weight (lbs)} & \\textbf{Average BMI} \\\\\n")
+cat("\\hline\n")
+for (i in 1:nrow(physical_stats)) {
+  row <- physical_stats[i, ]
+  cat(sprintf("%s & %.1f & %.1f & %.2f \\\\\n",
+              row$Position, row$Avg_Height, row$Avg_Weight, row$Avg_BMI))
+}
+cat("\\end{tabular}\n")
+cat("\\end{center}\n")
+```
+
+The data shows a clear gradient in both height and weight across positions, with Centers (208.32 cm, 115.12 kg) and Power Forwards (204.07 cm, 110.11 kg) being substantially taller and heavier than guards. Point Guards represent the smallest position (185.76 cm, 85.41 kg). Interestingly, BMI remains relatively consistent across positions (ranging from 24.76 to 26.54), suggesting that players maintain proportional physiques optimized for their specific roles regardless of absolute size.
+
+These physical differences directly influence shot selection and defensive coverage patterns:
+
+```{r, fig.show='hold', out.width='48%', fig.align='default',echo=FALSE, fig.cap="Bar charts showing shot/defender distance by position", fig.height=3}
+# Ensure numeric columns
+nba_data$SHOT_DISTANCE <- as.numeric(as.character(nba_data$SHOT_DISTANCE))
+nba_data$CLOSE_DEF_DIST <- as.numeric(as.character(nba_data$CLOSE_DEF_DIST))
+
+distance_stats <- data.frame(Position = character(), 
+                             Avg_Shot_Distance = numeric(), 
+                             Avg_Defender_Distance = numeric(), 
+                             stringsAsFactors = FALSE)
+
+for (pos in positions) {
+  pos_data <- nba_data[nba_data$Pos == pos, ]  # Use correct position column
+  # Only compute if there are non-NA values
+  if (sum(!is.na(pos_data$SHOT_DISTANCE)) > 0 & sum(!is.na(pos_data$CLOSE_DEF_DIST)) > 0) {
+    distance_stats <- rbind(distance_stats, data.frame(
+      Position = pos,
+      Avg_Shot_Distance = mean(pos_data$SHOT_DISTANCE, na.rm = TRUE),
+      Avg_Defender_Distance = mean(pos_data$CLOSE_DEF_DIST, na.rm = TRUE)
+    ))
+  }
+}
+
+# Remove rows with NA or non-finite values
+distance_stats <- distance_stats[is.finite(distance_stats$Avg_Shot_Distance) & 
+                                 is.finite(distance_stats$Avg_Defender_Distance), ]
+
+par(mar = c(4, 4, 2, 2), xpd = TRUE)
+
+# Plot if data exists
+if (nrow(distance_stats) > 0) {
+  barplot(distance_stats$Avg_Shot_Distance, names.arg = distance_stats$Position,
+          col = "darkgreen", main = "Average Shot Distance by Position", ylab = "Feet", las = 2)
+  barplot(distance_stats$Avg_Defender_Distance, names.arg = distance_stats$Position,
+          col = "purple", main = "Average Defender Distance by Position", ylab = "Feet", las = 2)
+} else {
+  message("No valid data to plot")
+}
+```
+
+Centers shoot from the shortest average distance (8.37 feet) while Guards and Forwards attempt shots from significantly longer distances (14.75-15.61 feet), reflecting traditional positional specialization. Centers face the closest defensive pressure (3.48 feet) while Small Forwards experience the most space (4.41 feet). This inverse relationship between shot distance and defensive pressure indicates defensive strategies prioritize contesting high-percentage interior attempts while allowing greater space for lower expected value perimeter shots.
+
+The combined analysis of physical attributes, shot selection, and defensive pressure provides a comprehensive picture of positional specialization in the NBA, demonstrating how physical characteristics shape strategic approaches to scoring and defense across different court positions.
+
+# Contextual factors {#sec:contextual-factors}
+
+After analyzing the intrinsic factors of experience and position, we now turn to extrinsic game conditions that affect shooting performance. These contextual factors—home court advantage, clutch situations, and defensive pressure—represent situational variables that interact with player attributes to determine shooting outcomes.
+
+## Home-Away Status and Clutch Intervals: Combined Performance Analysis {#sec:home-away}
+
+In this section, we investigate whether shot performance is impacted by the location of the game, that being a home or an away game. Specifically, we compare the total number of shot attempts and the shot accuracy between home and away games.
+
+We use the LOCATION variable, which takes the value “H” for home games and “A” for away games, and the SUCCESS variable, which equals 1 if the shot was made and 0 if it was unsuccessful.
+
+```{r shot-accurary-location, fig.height = 1.6, fig.width = 4, fig.cap="Bar chart of shot accuracy by location (Home vs Away).", fig.align="center", echo=FALSE}
+NBA <- read.csv("NBA_Shots_Clean.csv")
+
+# Shot counts and shooting accuracy
+Shot_counts <- NBA %>% count(LOCATION)
+Shot_accuracy <- NBA %>% group_by(LOCATION) %>% summarise(Accuracy = mean(SUCCESS))
+
+# Number of made shots and total shots
+Made_shots <- NBA %>% group_by(LOCATION) %>% summarise(Made = sum(SUCCESS))
+Total_shots <- NBA %>% count(LOCATION)
+
+# Shot accuracy bar plot
+ggplot(Shot_accuracy, aes(x = LOCATION, y = Accuracy)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = scales::percent(Accuracy, accuracy = 0.1)),
+            vjust = -0.5, size = 2.5) +
+  labs(x = "Location", y = "Shot Accuracy", title = "Shot Accuracy by Location (Home vs Away)") +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 9, face = "bold"),  
+        plot.subtitle = element_text(size = 8), 
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7), 
+        plot.margin = margin(5, 5, 5, 5)) + 
+  scale_y_continuous(limits = c(0, max(position_efficiency$CI_Upper) * 1.05),  
+                    labels = percent_format(accuracy = 1))
+```
+
+Figure \@ref(fig:shot-accurary-location) shows higher shot_accuracy at home compared to away games. However for shot_counts there is a similair number of overall for both home and away games. To determine whether the observed difference is statistically significant, we perform a two-proportion z-test.
+
+```{r, results='hide'}
+# Z-test
+z_test_result <- prop.test(Made_shots$Made, Total_shots$n, correct = FALSE)
+```
+
+```{r, echo=FALSE}
+# Print only selected parts
+cat("2-sample test for equality of proportions without continuity correction\n")
+cat("data:  Made_shots$Made out of Total_shots$n\n")
+cat("X-squared =", z_test_result$statistic, ", df =", z_test_result$parameter, ", p-value =", z_test_result$p.value, "\n")
+cat("sample estimates:\n")
+cat("    prop 1     prop 2 \n")
+cat(sprintf("%.7f %.7f\n", z_test_result$estimate[1], z_test_result$estimate[2]))
+```
+
+Shot accuracy is significantly higher at home (45.79%) compared to away games (45.01%), with a statistically significant difference (p=0.0059) across 62,000+ shots in each condition. Z-test results (z=-2.75) confirm this small but meaningful 0.78% advantage. Home court advantages likely include crowd support boosting player confidence, court familiarity improving shooting conditions, and absence of travel fatigue affecting focus and performance. NBA players traveling approximately 40,000 miles per season suggests jet lag may contribute to this performance differential.
+
+While the percentage difference (0.78%) is small in absolute terms, the statistical significance indicates it's a reliable finding rather than random variation.
+
+Next we analyse how being in a late game 'clutch period' effects a players performance. We have defined this clutch period to be in the final two minutes of the fourth quarter.
+
+```{r, echo=FALSE, results='hide'}
+# Create clutch flag
+NBA$IS_CLUTCH <- (NBA$PERIOD == 4) & (NBA$SEC_REMAIN <= 120)
+
+# Clutch vs non-clutch shot accuracy
+Clutch_accuracy <- NBA %>% group_by(IS_CLUTCH) %>% summarise(Accuracy = mean(SUCCESS))
+
+# Made shots and total attempts
+Made_clutch <- NBA %>% group_by(IS_CLUTCH) %>% summarise(Made = sum(SUCCESS))
+Total_clutch <- NBA %>% count(IS_CLUTCH)
+
+# Z test
+z_test_result_2 <- prop.test(Made_clutch$Made, Total_clutch$n, correct = FALSE)
+```
+
+The shooting accuracy during non-clutch periods was 45.48%, however the shooting accuracy during clutch periods dropped to 43.54%. The proportion test shows a p value p < 0.05 and hence there is a significant difference between shot accuracy.
+
+This is likely due to a number of reasons, including:
+
+* Less pressure - Athletes have more time to analyse their shot before taking it rather than feeling the pressure the clutch period brings.
+* Fatigue - Players may simply be tired at this late point in the game, which is a likely factor of why their shot accuracy may differ.
+* Desperation - Although it rarer than factors like fatigue, many teams have been in situations where they are 1-2 points down in the closing seconds, and in turn may take a half-court shot in the hope of winning the game in the final play. It is highly unlikely that these shots succeed, even though it may be the only option at that point in the game.
+
+```{r, fig.height = 1.6, fig.width = 4, fig.cap="Plot of shot accuracy in clutch period vs non-clutch period.", fig.align="center", echo=FALSE}
+# Shot accuracy clutch vs non-clutch
+ggplot(Clutch_accuracy, aes(x = factor(IS_CLUTCH, labels = c("Non-Clutch", "Clutch")), y = Accuracy)) +
+  geom_bar(stat = "identity", fill = "tomato") +
+  geom_text(aes(label = scales::percent(Accuracy, accuracy = 0.1)),
+            vjust = -0.5, size = 2.5) +
+  labs(x = "Period", y = "Shot Accuracy", title = "Shot Accuracy: Clutch vs Non-Clutch") +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 9, face = "bold"),  
+        plot.subtitle = element_text(size = 8),  
+        axis.title = element_text(size = 8),  
+        axis.text = element_text(size = 7),  
+        plot.margin = margin(5, 5, 5, 5)) +  
+  scale_y_continuous(limits = c(0, max(position_efficiency$CI_Upper) * 1.05),  
+                    labels = percent_format(accuracy = 1))
+```
+
+In the context of things, the drop of around 2% is significant, however possibly less than we may expect considering the pressure of being in the final 120 seconds of a game. This just shows the high level of skill and quality of players the NBA has in order for them to still stay relatively accurate in these sitautions.
+
+## Defender distance and shot outcome {#sec:defender-distance}
+
+In this part of the section we will analyse how the distance of the closest defender impacts shot accuracy.
+
+```{r, echo=FALSE}
+# Create defender distance buckets
+NBA$DEF_DIST_BUCKET <- cut(NBA$CLOSE_DEF_DIST,
+                            breaks = c(0, 2, 4, 6, 8, 10, 20),
+                            labels = c("0-2 ft", "2-4 ft", "4-6 ft", "6-8 ft", "8-10 ft", "10+ ft"),
+                            right = TRUE)
+
+# Calculate accuracy by defender distance bucket
+Defender_accuracy <- NBA %>%
+  group_by(DEF_DIST_BUCKET) %>%
+  summarise(Accuracy = mean(SUCCESS), Shots = n())
+```
+
+```{r, fig.height = 1.8, fig.width = 4, fig.cap="Plot to show shot accuracy depending on distance of closest defender.", fig.align="center", echo=FALSE}
+# Bar plot: Shot Accuracy vs Defender Distance
+ggplot(Defender_accuracy, aes(x = DEF_DIST_BUCKET, y = Accuracy)) +
+  geom_bar(stat = "identity", fill = "mediumseagreen") +
+  geom_text(aes(label = scales::percent(Accuracy, accuracy = 0.1)),
+            vjust = -0.5, size = 2.5) +
+  labs(x = "Defender Distance (ft)", y = "Shot Accuracy", title = "Shot Accuracy by Defender Distance") +
+  ylim(0, 1) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 9, face = "bold"),  
+        plot.subtitle = element_text(size = 8),  
+        axis.title = element_text(size = 8), 
+        axis.text = element_text(size = 7),  
+        plot.margin = margin(5, 5, 5, 5)) +  
+  scale_y_continuous(limits = c(0, max(position_efficiency$CI_Upper) * 1.05),  
+                    labels = percent_format(accuracy = 1))
+```
+
+These results do not perfectly fit the pattern we might assume, that is that the further away the defender, the higher shot accuracy due to the player having more time to make their shot. However, there is a rough correlation as we can see the peak shot accuracy is at 10+ ft.
+
+Some takeaways from the results we have obtained in this part of the analysis include:
+
+* Players that are shooting under pressure from defenders (0-2 ft) are likely to have a lower success rate.
+* There may be some correlation between defender distance and distance from the basket. Using this, it would make sense to see a suprisingly higher shot accuracy from around 0-4 ft as it may imply the type of shots being taken are dunks or lay-ups, which tend to have a higher success rate than mid-range shots like on-the-line three pointers. This is shown by the dip in shot accuracy at the mid-point of defender distance.
+* Although there are multiple things to consider as discussed above, the values do follow the expected trend that at 10+ ft the highest shot accuracy is obtained.
+* Finally, players are probably less likely to try and get a shot off in a highly contested situation when a defender or multiple defenders are close in distance. This may skew the data and exaggerate the impact of the defenders distance on shot accuracy, and hence is a significant limitation of this part of our analysis.
+
+# Financial Analysis {#sec:financial-analysis}
+
+This section investigates the financial strategies used in the NBA, do the salaries accurately reflect the players performance? And are there statistically significant strategies when recruiting players and allocating cap? The table below displays the discrepancy between player salary distribution in the 2014-2015 season, compared to the estimated equivalent value today. We used the US CPI inflation index [@cpi2024] to calculate the 36.9% increase of the US dollar since 2014 and the NBA cap 2025-2026 [@spotrac2025] to compute the 145.2% growth in the team allocation cap since the 2014-15 season [@nba2014]. This demonstrates how the NBA has had significantly faster economic growth than the US inflation factor.
+
+```{r, echo=FALSE}
+adj_factors <- c(Actual_2014 = 1, CPI_Inflation = 1.452, NBA_Inflation = 2.23)
+stat_names <- c("Max", "Mean", "Median", "Min")  
+
+# Compute summary statistics for actual salary
+salary_stats <- c(
+  Max    = max(player_salary$Salary),
+  Mean   = mean(player_salary$Salary),
+  Median = median(player_salary$Salary),
+  Min    = min(player_salary$Salary)
+)
+
+# Create a matrix: each row = adjustment, each column = statistic
+salary_mat <- sapply(adj_factors, function(f) salary_stats * f)
+salary_mat <- t(salary_mat)
+colnames(salary_mat) <- stat_names
+
+# Print the salary values as a table with commas
+print(format(round(salary_mat), scientific = FALSE))
+```
+
+## Relationship between Experience and Salary {#sec:experience-salary}
+
+We investigate the relationship between player experience and salary by cleaning the data set to ensure experience and salary are numeric and complete (Rookies are assigned a value of 0 for experience.) The boxplots (Figure \@ref(fig:salary-dist)) display the distribution of salaries by experience. We can visually derive an increasing trend amongst the mean distribution of the boxplots, indicating that veteran players obtain higher salaries.
+
+```{r salary-dist, echo=FALSE, fig.height=2.8, fig.width=5, fig.cap="Relationship between player experience and salary, with regression line (red) and 95% confidence interval (green)."}
+
+par(mar = c(4, 4, 2, 2))  
+
+# Load data
+df <- complete_data
+
+# Clean Experience
+df$Experience <- as.character(df$Experience)
+df$Experience[df$Experience == "R"] <- "0"
+df$Experience <- as.numeric(df$Experience)
+
+# Remove missing data
+df <- df[!is.na(df$Experience) & !is.na(df$Salary), ]
+
+# Create factor
+df$Experience_factor <- factor(df$Experience)
+
+# Fit model
+fit <- lm(I(Salary / 1e6) ~ Experience, data = df)
+
+# Make sequence of experience values for prediction
+exp_seq <- sort(unique(df$Experience))
+
+# Predict with confidence interval
+pred <- predict(fit, newdata = data.frame(Experience = exp_seq), 
+                interval = "confidence", level = 0.95)
+
+# Manually widen the confidence interval to make it more visible
+# This is just for visualisation purposes
+ci_width_factor <- 5  
+pred_mean <- pred[, "fit"]
+pred_width <- pred[, "upr"] - pred[, "lwr"]
+pred[, "lwr"] <- pred_mean - (pred_width/2 * ci_width_factor)
+pred[, "upr"] <- pred_mean + (pred_width/2 * ci_width_factor)
+
+# Create boxplot
+boxplot(I(Salary / 1e6) ~ Experience_factor, 
+        data = df,
+        xlab = "Experience (Years)",
+        ylab = "Salary (Million USD)",
+        main = "Salary Distribution by Experience with Regression Line & 95% CI",
+        col = "lightblue", 
+        border = "darkblue",
+        outline = TRUE,  
+        cex.lab = 0.7,    
+        cex.main = 0.7    
+)
+grid()
+
+# Get numeric values of experience levels
+exp_levels <- as.numeric(levels(df$Experience_factor))
+
+# Match exp_seq to the position on x-axis
+x_pos <- match(exp_seq, exp_levels)
+
+# Add confidence interval polygon
+polygon(
+  c(x_pos, rev(x_pos)),
+  c(pred[, "lwr"], rev(pred[, "upr"])),
+  col = "springgreen", border = NA
+)
+
+# Add confidence interval lines
+lines(x_pos, pred[, "lwr"], col = "firebrick2", lty = 2, lwd = 3)
+lines(x_pos, pred[, "upr"], col = "firebrick2", lty = 2, lwd = 3)
+
+# Add regression line
+lines(x_pos, pred[, "fit"], col = "firebrick2", lwd = 2)
+
+legend("topleft", legend = c("Regression line", "95% CI"),
+       col = c("firebrick2", rgb(0.7, 0.9, 0.7, 0.5)),
+       lwd = c(2, 10), bty = "n", seg.len = 2, cex = 0.8)
+```
+
+```{r, echo=FALSE}
+# Calculate correlation
+cor.test(df$Experience, df$Salary)
+```
+
+The Pearson correlation coefficient estimated to be 0.466 leads us to reject the null hypothesis as there is statistically significant evidence of a positive linear correlation between Experience and Salary. This reinforces that veterans are allocated a higher salary. However, the wide ranges visible in the boxplots indicate that other factors still play a role in influencing salary.
+
+## Performance Metrics vs Salary {#sec:performance-metrics-vs-salary}
+
+We next investigate other potential factors that could influence salary and calculate averages of these metrics using the `aggregate()` function with `FUN = mean`. Using a heatmap (Figure \@ref(fig:heatmap-salary)) to display the Pearson correlation coefficient of salary with several metrics, we aim to identify which obtain the strongest influence.
+
+From Figure \@ref(fig:heatmap-salary), we are able to derive that one of the strongest factors influencing salary from the NBA_Shots data set is `TOUCH_TIME`. The positive correlation (p-value = 0.25) indicates players who possess the ball for longer typically earn higher salaries. Notably, salary is negatively correlated with `SHOT_DISTANCE` (p-value = -0.07) and `CLOSE_DEF_DIST` (p-value = -0.15), showing that players on a higher salary will not necessarily take more distanced or contested shots. Overall, the performance metrics generally exhibit weak correlation, thus suggesting that a player's salary is influenced by a combination of performance statistics, as well as other factors.
+
+To further examine potential market inefficiencies, we focus on shooting guards and develop a linear regression model to predict salary as a function of points scored. We adopt a linear regression model to predict the salary as a function of points scored. A scatter plot illustrating this model, including a regression line with a 95% confidence interval, is presented in Figure \@ref(fig:salary-points) in the Appendix. Table \@ref(tab:salary-comparison) in the Appendix presents the top 5 underpaid and overpaid shooting guards based on our analysis.
+
+```{r heatmap-salary, echo=FALSE, fig.width=5, fig.height=3.2, fig.cap="Matrix showing correlations between performance metrics and salary"}
+perf_metrics <- aggregate(
+  cbind(SUCCESS, SHOT_DISTANCE, CLOSE_DEF_DIST, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, Salary) ~ PLAYER_NAME,
+  data = df,
+  FUN = mean,
+  na.rm = TRUE
+)
+colnames(perf_metrics) <- c("PLAYER_NAME", "SUCCESS", "SHOT_DISTANCE", "CLOSE_DEF_DIST", "SHOT_CLOCK", "DRIBBLES", "TOUCH_TIME", "Salary")
+
+# Calculate correlation matrix
+cor_matrix <- cor(perf_metrics[, c("Salary", "SUCCESS", "SHOT_DISTANCE",
+                                "CLOSE_DEF_DIST", "SHOT_CLOCK",
+                                "DRIBBLES", "TOUCH_TIME")],
+                use = "complete.obs")
+
+# Plot with corrplot
+library(corrplot)
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "full",
+  addCoef.col = "black",
+  tl.col = "black",
+  tl.srt = 90,
+  number.cex = 0.7,
+  tl.cex = 0.7,
+  cl.cex = 0.7,
+  col = colorRampPalette(c("#4575b4", "#ffffbf", "#4575b4", "#ffffbf", "#d73027"))(200),
+  mar = c(0,0,0,0)
+)
+```
+
+```{r , echo=FALSE, results='hide'}
+# Load your data
+nba_df <- complete_data
+
+# Filter for shooting guards
+sg_df <- nba_df[nba_df$Pos == "SG", ]
+
+# Calculate total points per player
+sg_df$Points <- ifelse(sg_df$SUCCESS == 1, sg_df$PTS_TYPE, 0)
+sg_points <- aggregate(Points ~ PLAYER_NAME, data = sg_df, sum)
+
+# Calculate total salary per player
+sg_salary <- aggregate(Salary ~ PLAYER_NAME, data = sg_df, FUN = mean)
+
+# Merge points and salary
+merged <- merge(sg_points, sg_salary, by = "PLAYER_NAME")
+
+# Fit the model
+fit <- lm(I(Salary / 1e6) ~ Points, data = merged)
+
+# Calculate residuals
+merged$PredictedSalary <- predict(fit, merged)
+merged$Residual <- (merged$Salary / 1e6) - merged$PredictedSalary
+
+# Get top 5 underpaid and overpaid players
+underpaid_sg <- merged[order(merged$Residual), ][1:5, ]
+overpaid_sg <- merged[order(-merged$Residual), ][1:5, ]
+
+# Add confidence interval
+new_points <- seq(min(merged$Points), max(merged$Points), length.out = 100)
+pred_int <- predict(fit, newdata = data.frame(Points = new_points), interval = "confidence")
+
+# Identify outliers
+outliers <- merged[abs(rstandard(fit)) > 2, ]
+```
+
+```{r, echo=FALSE}
+# Store the model summary for access
+model_summary <- summary(fit)
+
+# Print condensed output
+cat("## Call: lm(formula = I(Salary/1e+06) ~ Points, data = merged)\n")
+cat("## Coefficients:\n")
+cat("## (Intercept)  Points  \n")
+cat(sprintf("##   %.6f   %.6f %s\n", 
+            coef(fit)[1], 
+            coef(fit)[2], 
+            ifelse(model_summary$coefficients[2,4] < 0.01, "**", 
+                   ifelse(model_summary$coefficients[2,4] < 0.05, "*", ""))))
+cat(sprintf("## Adjusted R-squared: %.4f, F-statistic: %.2f, p-value: %.6f\n", 
+            model_summary$adj.r.squared,
+            model_summary$fstatistic[1],
+            pf(model_summary$fstatistic[1], 
+               model_summary$fstatistic[2], 
+               model_summary$fstatistic[3], 
+               lower.tail = FALSE)))
+
+# Add the most underpaid and overpaid players (first of each list)
+print(outliers)
+```
+
+The ANOVA test tells us that the model explains 18.39% of the variance amongst salaries and shooting guards. The statistically significant p-value (p = 0.001929) from the F-test proves the model to be a strong predictor of salary for shooting guards. By examining regression residuals, we are able to identify players who outperformed their salary expectation. Klay Thompson was ranked the most underpaid based on this regression model, by an est of -6.2 million based on performance. Kobe Bryant was ranked the most overpaid, by an est of 18.2 million, and, alongside Joe Johnson, was statistically deemed an "outlier" - there is not enough statistical evidence that performance has influenced their salaries. 
+
+## Cap allocation strategy {#sec:cap-allocation}
+
+For this section, we compiled a CSV `NBA_Team_Salary_Cap_Tracker.csv`, with extracted data about cap allocation [@spotrac2015]. Using this data, we analyse how NBA teams allocate their cap - is there a strategy? For each team, we classify them as "Top-Heavy" if >50% of the cap was spent on the top 3 player's salaries, and balanced if not.  The detailed breakdown of cap allocation by team can be found in the Appendix (Figure \@ref(fig:stacked-cap-appendix)). The red shaded region in the appendix figure visualises when a team exceeds the set cap of 63.065 million [@wikipedia2019], which would lead to luxury tax.
+
+```{r win-cap-plot, echo=FALSE, fig.width=6, fig.height=2.5, fig.cap="Win Percentage vs. Cap Allocation."}
+Team_cap_info$Win_Pct <- Team_cap_info$Wins / (Team_cap_info$Wins + Team_cap_info$Losses)
+Team_cap_info$Top3_Cap_Percent <- Team_cap_info$Top3 / Team_cap_info$TotalCap
+Team_cap_info$TeamType <- ifelse(Team_cap_info$Top3_Cap_Percent > 0.5, "Top-Heavy", "Balanced")
+Team_cap_info$Color <- ifelse(Team_cap_info$TeamType == "Top-Heavy", "red", "blue")
+Team_cap_info <- Team_cap_info[order(Team_cap_info$Allocations), ]
+
+par(mar = c(4, 4, 3, 6), xpd = TRUE)
+
+plot(Team_cap_info$Allocations / 1e6, Team_cap_info$Win_Pct,
+     col = scales::alpha(Team_cap_info$Color, 0.6), pch = 19, cex.main = 0.7,
+     xlab = "Cap Allocation (Millions)", ylab = "Win Percentage",
+     main = "Win % vs. Cap Allocation", cex.lab = 0.7, cex.axis = 0.7)
+
+usr <- par("usr")
+rect(xleft = 63.065, ybottom = usr[3], xright = usr[2], ytop = usr[4],
+     col = rgb(1, 0, 0, 0.1), border = NA)
+abline(v = 63.065, col = "firebrick", lwd = 2, lty = 2)
+grid(col = "lightgray", lty = "dotted")
+lines(Team_cap_info$Allocations / 1e6, Team_cap_info$Win_Pct, lty = 2, col = "gray")
+
+legend("topleft", legend = c("Top-Heavy", "Balanced"),
+       col = c("red", "blue"), pch = 19, cex = 0.7)
+```
+
+In Figure \@ref(fig:win-cap-plot), we plot the win percentage for each individual team vs the cap allocation, colouring them blue for "Balanced" and red for "Top-Heavy". The plot suggests a positive trend, showing Teams that spend more typically have a higher win rate.  
+
+```{r, echo=FALSE}
+kruskal_result <- kruskal.test(Win_Pct ~ TeamType, data = Team_cap_info)
+print(kruskal_result)
+```
+
+The Kruskal-Wallis Test confirms there is no statistically significant evidence (p > 0.01) to reject the null hypothesis, thus there is not a clear difference in win percentage distribution between Top-Heavy and Balanced. This determines that cap allocation strategies are not effective. 
+
+# Conclusion {#sec:Conclusion}
+
+We carried out an exploratory analysis of the `NBA_SHOTS_CLEAN` dataset from the 2014-2015 NBA season by looking at player performance metrics, contextual in game factors, and financial data. Our approach combined hypothesis testing (including ANOVA and non-parametric tests) and correlation analysis to find patterns in shot efficiency and salary distribution. Visual tools such as bar charts, heatmaps, and regression plots were used to support the statistical findings.
+
+Our main observations are as follows:
+
+1. Player experience significantly influences shooting performance, with the largest improvements occurring between rookie and early career stages. However, efficiency levels out in later career stages (Section \@ref(sec:experience-based-shot)).
+2. Physical attributes like height interact heavily with experience, influencing shooting patterns across player groups. Taller players show high early career efficiency but experience mid career declines (Section \@ref(sec:attributes-experience)).
+3. Positional roles affect both shooting efficiency and shot selection, with centers showing the highest field goal percentages and shortest average shot distances. However, guards tend to take longer range and more contested shots (Section \@ref(sec:position-analysis)).
+4. Contextual game factors matter. Players perform better at home, underperform during clutch periods, and benefit from increased defender distance, though these effects are sometimes affected by other variables (Section \@ref(sec:contextual-factors)).
+5. Salaries correlate moderately with experience and certain performance metrics like ball possession time. Salaries also reflect factors not captured by shot efficiency alone (Section \@ref(sec:experience-salary) and \@ref(sec:performance-metrics-vs-salary)).
+6. Cap allocation does not show statistically significant differences in win percentage, suggesting that financial structure alone does not predict a teams success (Section \@ref(sec:cap-allocation)).
+
+Our findings are purely data based, and offer valuable insights into player shot efficiency and compensation. However, many conclusions in this report could be reinforced and supported by, for example, analysing data from multiple seasons or incorporating specific player tracking data.
+
+\newpage
+
+# Appendix {-}
+
+Table \@ref(tab:experience-summary) presents the distribution of shot attempts across experience groups, which provides context for interpreting trends in shot selection and efficiency.
+
+```{r experience-summary, echo=FALSE}
+# Experience group summary
+exp_summary <- shots_with_all %>%
+  group_by(experience_group) %>%
+  summarise(
+    count = n(),
+    percentage = n() / nrow(shots_with_all) * 100,
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(experience_group))
+
+kable(exp_summary, format = "latex", booktabs = TRUE, 
+      caption = "Distribution of shot attempts across experience groups",
+      table.envir = "table", position = "H") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  column_spec(1, bold = TRUE)
+```
+
+Figure \@ref(fig:salary-points) illustrates the relationship between total points scored and salary for NBA shooting guards, featuring a linear regression line with a 95% confidence interval to highlight deviations in player compensation.
+
+```{r salary-points, echo=FALSE, fig.width=8, fig.height=5, fig.cap="Salary vs. points scored for NBA shooting guards, with regression line and confidence interval"}
+par(mar = c(4, 4, 2, 10), xpd = TRUE)
+
+# Create plot
+plot(merged$Points, merged$Salary / 1e6,
+     xlab = "Points Scored (Season Total)",
+     ylab = "Salary (Million USD)",
+     main = "Player Salary vs. Points Scored",
+     pch = 19, col = "blue", cex = 0.7,
+     cex.main = 0.9, cex.lab = 0.8, cex.axis = 0.7)
+
+# Add grid
+grid(col = "lightgray", lty = "dotted")
+
+# Add confidence interval polygon
+polygon(
+  c(new_points, rev(new_points)),
+  c(pred_int[, "lwr"], rev(pred_int[, "upr"])),
+  col = rgb(0.7, 0.9, 0.7, 0.5), border = NA
+)
+
+# Add regression line and confidence bands
+abline(fit, col = "red", lwd = 1.5)
+lines(new_points, pred_int[, "lwr"], col = "firebrick2", lty = 2, lwd = 1)
+lines(new_points, pred_int[, "upr"], col = "firebrick2", lty = 2, lwd = 1)
+
+# Highlight over/underpaid players with smaller points
+points(underpaid_sg$Points, underpaid_sg$Salary / 1e6, col = "forestgreen", pch = 19, cex = 1.2)
+points(overpaid_sg$Points, overpaid_sg$Salary / 1e6, col = "firebrick2", pch = 19, cex = 1.2)
+
+# Label the points with offset positions to prevent overlap
+text(underpaid_sg$Points, underpaid_sg$Salary / 1e6, 
+     labels = underpaid_sg$PLAYER_NAME, pos = c(4,3,2,1,4), 
+     col = "forestgreen", cex = 0.55, offset = 0.3)
+text(overpaid_sg$Points, overpaid_sg$Salary / 1e6, 
+     labels = overpaid_sg$PLAYER_NAME, pos = c(3,4,1,2,3), 
+     col = "firebrick2", cex = 0.55, offset = 0.3)
+
+legend("topright", inset = c(-0.3, 0), 
+       legend = c("Players", "Regression Line", "Confidence Interval", 
+                  "Top 5 Underpaid", "Top 5 Overpaid"),
+       col = c("blue", "red", rgb(0.7, 0.9, 0.7, 0.5), 
+               "forestgreen", "firebrick2"),
+       pch = c(19, NA, 15, 19, 19),
+       lty = c(NA, 1, NA, NA, NA),
+       pt.cex = c(0.7, NA, 1.5, 1, 1),
+       lwd = c(NA, 1.5, NA, NA, NA),
+       bty = "n", cex = 0.6, y.intersp = 1.1)
+```
+
+The following table \@ref(tab:salary-comparison), presents a detailed comparison of the top 5 underpaid and overpaid shooting guards during the 2014-2015 NBA season. This analysis is based on the linear regression model discussed in Section 5.3, which predicts expected salary based on points scored. The residual value represents the difference between actual and predicted salary, with negative values indicating underpaid players and positive values indicating overpaid players.
+
+```{r salary-comparison, echo=FALSE}
+# Combine underpaid and overpaid players with status labels
+combined <- rbind(
+  cbind(Status = "Underpaid", underpaid_sg[, c("PLAYER_NAME", "Salary", "Points", "PredictedSalary", "Residual")]),
+  cbind(Status = "Overpaid", overpaid_sg[, c("PLAYER_NAME", "Salary", "Points", "PredictedSalary", "Residual")])
+)
+
+# Format numeric columns
+combined <- combined %>%
+  mutate(
+    Salary = paste0("$", format(round(Salary), big.mark = ",")),
+    PredictedSalary = paste0("$", format(round(PredictedSalary * 1e6), big.mark = ",")),
+    Residual = paste0("$", format(round(Residual * 1e6), big.mark = ","))
+  ) %>%
+  rename(
+    "Player Name" = PLAYER_NAME,
+    "Actual Salary" = Salary,
+    "Total Points" = Points,
+    "Predicted Salary" = PredictedSalary,
+    "Residual Value" = Residual
+  )
+
+# Create formatted table
+kable(combined, format = "latex", booktabs = TRUE, 
+      caption = "Top 5 Underpaid and Overpaid Shooting Guards (2014-2015 Season)",
+      table.envir = "table", position = "H") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(1:5, background = "#e6ffe6") %>%  # Light green for underpaid
+  row_spec(6:10, background = "#ffe6e6")     # Light red for overpaid
+```
+
+In Figure \@ref(fig:stacked-cap-appendix), we can observe the detailed breakdown of how each NBA team allocates its salary cap. Teams that extend into the red shaded region are subject to luxury tax penalties. This visualisation helps us understand the different cap strategies employed across the league, with some teams heavily investing in their top 3 players while others distribute their cap more evenly.
+
+```{r stacked-cap-appendix, echo=FALSE, fig.width=5, fig.height=2.8, fig.cap="Cap Breakdown by Team: Stacked barplot showing the allocation of each team's salary cap to the Top 3 players, Dead Cap, and the remaining cap. The red shaded area indicates the salary cap limit; teams above this line are in luxury tax territory."}
+# Prepare data
+Team_cap_info$Top3_Cap_Percent <- Team_cap_info$Top3 / Team_cap_info$TotalCap
+Team_cap_info$TeamType <- ifelse(Team_cap_info$Top3_Cap_Percent > 0.5, "Top-Heavy", "Balanced")
+Team_cap_info$RestCap <- Team_cap_info$TotalCap - Team_cap_info$Top3 - Team_cap_info$DeadCap
+
+cap_matrix <- t(as.matrix(data.frame(
+  Top3    = Team_cap_info$Top3    / 1e6,
+  DeadCap = Team_cap_info$DeadCap / 1e6,
+  Rest    = Team_cap_info$RestCap / 1e6
+)))
+
+par(mar = c(5, 4, 2, 1), xpd = FALSE)
+
+# Draw barplot 
+bp <- barplot(
+  cap_matrix,
+  beside = FALSE,
+  col = c("firebrick2", "white", "slateblue"),
+  names.arg = Team_cap_info$Team,
+  las = 2,
+  main = "Cap Breakdown by Team",
+  cex.main = 0.8,
+  ylab = "Cap Amount (Millions)",
+  cex.names = 0.6,
+  cex.axis = 0.8,
+  cex.lab = 0.8,
+  space = 0.2
+)
+
+abline(h = 63.065, col = "red", lwd = 2, lty = 2)
+rect(
+  xleft = par("usr")[1],
+  ybottom = 63.065,
+  xright = par("usr")[2],
+  ytop = par("usr")[4],
+  col = rgb(1, 0, 0, 0.2),
+  border = NA
+)
+
+par(xpd = TRUE)
+legend(
+  "bottom",
+  inset = c(0, -0.18),
+  horiz = TRUE,
+  legend = c("Top 3", "Dead Cap", "Rest"),
+  fill = c("firebrick2", "white", "slateblue"),
+  bty = "n",
+  cex = 0.8
+)
+par(xpd = FALSE)
+```
