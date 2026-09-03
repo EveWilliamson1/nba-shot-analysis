@@ -37,7 +37,7 @@ The PDF contains the complete analysis, results and visualisations, while the R 
 
 ## Group Project
 
-This was completed as a **collaborative university project** with Megan Sanderson, Clara Thompson and Sam James.
+This was completed as a **collaborative university project** 
 
 ---
 
